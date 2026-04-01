@@ -1862,7 +1862,7 @@ float tangent(float x)
     //if (x <= -std::numeric_limits<float>::max()) return -std::numeric_limits<float>::max();
     if (x < 100000.0f && x > -100000.0f) return x;
     if (x >= 100000.0f) return 100000.0f;
-    if (x <= 100000.0f) return -100000.0f;
+    if (x <= -100000.0f) return -100000.0f;
     return 0.0f;
 }
 
@@ -2126,6 +2126,10 @@ void Spell::SearchChainTargets(std::list<WorldObject*>& targets, uint32 chainTar
             break;
     }
 
+    // per-spell override from spell_jump_distance table
+    if (m_spellInfo->JumpDistance > 0.0f)
+        jumpRadius = m_spellInfo->JumpDistance;
+
     // chain lightning/heal spells and similar - allow to jump at larger distance and go out of los
     bool isBouncingFar = (m_spellInfo->HasAttribute(SPELL_ATTR4_BOUNCY_CHAIN_MISSILES)
                           || m_spellInfo->DmgClass == SPELL_DAMAGE_CLASS_NONE
@@ -2243,7 +2247,7 @@ void Spell::prepareDataForTriggerSystem(AuraEffect const* /*triggeredByAura*/)
     // Hunter trap spells - activation proc for Lock and Load, Entrapment and Misdirection
     if (m_spellInfo->SpellFamilyName == SPELLFAMILY_HUNTER &&
             (m_spellInfo->SpellFamilyFlags[0] & 0x18 ||              // Freezing and Frost Trap, Freezing Arrow
-             m_spellInfo->Id == 57879 || m_spellInfo->Id == 45145 ||  // Snake Trap - done this way to avoid double proc
+             m_spellInfo->Id == 57879 ||                               // Snake Trap - done this way to avoid double proc
              m_spellInfo->SpellFamilyFlags[2] & 0x00024000))          // Explosive and Immolation Trap
     {
         m_procAttacker |= PROC_FLAG_DONE_TRAP_ACTIVATION;
@@ -2747,8 +2751,7 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         float threat = float(gain) * 0.5f;
         if (caster->IsClass(CLASS_PALADIN))
             threat *= 0.5f;
-
-        unitTarget->getHostileRefMgr().threatAssist(caster, threat, m_spellInfo);
+        unitTarget->GetThreatMgr().ForwardThreatForAssistingMe(caster, threat, m_spellInfo);
         m_healing = gain;
 
         // Xinef: if heal actually healed something, add no overheal flag
@@ -2873,8 +2876,7 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         if (missInfo == SPELL_MISS_RESIST && m_spellInfo->HasAttribute(SPELL_ATTR0_CU_PICKPOCKET) && unitTarget->IsCreature() && m_caster)
         {
             m_caster->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TALK);
-            if (unitTarget->ToCreature()->IsAIEnabled)
-                unitTarget->ToCreature()->AI()->AttackStart(m_caster);
+            unitTarget->ToCreature()->EngageWithTarget(m_caster);
         }
     }
 
@@ -2883,19 +2885,7 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         if (missInfo != SPELL_MISS_EVADE && !m_caster->IsFriendlyTo(effectUnit) && (!m_spellInfo->IsPositive() || m_spellInfo->HasEffect(SPELL_EFFECT_DISPEL)))
         {
             if (!m_triggeredByAuraSpell.spellInfo || m_damage || (!(m_triggeredByAuraSpell.spellInfo->Effects[m_triggeredByAuraSpell.effectIndex].TriggerSpell == m_spellInfo->Id) && !(m_triggeredByAuraSpell.spellInfo->IsAuraEffectEqual(m_spellInfo))))
-                m_caster->CombatStart(effectUnit, !(m_spellInfo->AttributesEx3 & SPELL_ATTR3_SUPPRESS_TARGET_PROCS));
-
-            // Patch 3.0.8: All player spells which cause a creature to become aggressive to you will now also immediately cause the creature to be tapped.
-            if (effectUnit->IsInCombatWith(m_caster))
-            {
-                if (Creature* creature = effectUnit->ToCreature())
-                {
-                    if (!creature->hasLootRecipient() && m_caster->IsPlayer())
-                    {
-                        creature->SetLootRecipient(m_caster);
-                    }
-                }
-            }
+                m_caster->AtTargetAttacked(effectUnit, !(m_spellInfo->HasAttribute(SPELL_ATTR1_NO_THREAT) || m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS)));
 
             // Unsure if there are more spells that are not supposed to stop enemy from
             // regenerating HP from food, so for now it stays as an ID.
@@ -3032,10 +3022,11 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
             }
 
             // xinef: triggered spells should not prolong combat
-            if (unit->IsInCombat() && !m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS) && !m_triggeredByAuraSpell)
+            if (m_originalCaster && unit->IsInCombat() && !m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS) && !m_triggeredByAuraSpell)
             {
-                m_caster->SetInCombatState(unit->GetCombatTimer() > 0, unit);
-                unit->getHostileRefMgr().threatAssist(m_caster, 0.0f);
+                if (m_originalCaster->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
+                    m_originalCaster->GetCombatManager().InheritCombatStatesFrom(unit);
+                unit->GetThreatMgr().ForwardThreatForAssistingMe(m_originalCaster, 0.0f, nullptr, true);
             }
         }
     }
@@ -3255,7 +3246,7 @@ void Spell::DoTriggersOnSpellHit(Unit* unit, uint8 effMask)
                             Aura* aur = unit->GetAura(m_spellInfo->Id, m_caster->GetGUID());
                             _duration = aur ? aur->GetDuration() : -1;
                         }
-                        triggeredAur->SetDuration(_duration);
+                        triggeredAur->SetDuration(std::max(triggeredAur->GetDuration(), _duration));
                     }
                 }
             }
@@ -3628,6 +3619,12 @@ SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const
 
         m_caster->SetCurrentCastedSpell(this);
         SendSpellStart();
+
+        // Call CreatureAI hook OnSpellStart for spells with cast time or channeled spells
+        if (m_casttime > 0 || m_spellInfo->IsChanneled())
+            if (Creature* caster = m_caster->ToCreature())
+                if (caster->IsAIEnabled)
+                    caster->AI()->OnSpellStart(GetSpellInfo());
 
         // set target for proper facing
         if ((m_casttime || m_spellInfo->IsChanneled()) && !HasTriggeredCastFlag(TRIGGERED_IGNORE_SET_FACING))
@@ -4016,7 +4013,7 @@ void Spell::_cast(bool skipCheck)
             break;
         }
 
-        Unit::ProcSkillsAndAuras(m_originalCaster, m_originalCaster, procAttacker, PROC_FLAG_NONE, hitMask, 1, BASE_ATTACK, m_spellInfo, m_triggeredByAuraSpell.spellInfo,
+        Unit::ProcSkillsAndAuras(m_originalCaster, nullptr, procAttacker, PROC_FLAG_NONE, hitMask, 1, BASE_ATTACK, m_spellInfo, m_triggeredByAuraSpell.spellInfo,
             m_triggeredByAuraSpell.effectIndex, this, nullptr, nullptr, PROC_SPELL_PHASE_CAST);
     }
 
@@ -4038,12 +4035,6 @@ void Spell::_cast(bool skipCheck)
             if (target->IsCreature())
                 m_caster->CastSpell(target, 32747, true);
 
-    // xinef: start combat at cast for delayed spells, only for explicit target
-    if (Unit* target = m_targets.GetUnitTarget())
-        if (m_caster->IsPlayer() || (m_caster->IsPet() && m_caster->IsControlledByPlayer()))
-            if (GetDelayMoment() > 0 && !m_caster->IsFriendlyTo(target) && !m_spellInfo->HasAura(SPELL_AURA_BIND_SIGHT) && (!m_spellInfo->IsPositive() || m_spellInfo->HasEffect(SPELL_EFFECT_DISPEL)))
-                m_caster->CombatStartOnCast(target, !m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS), GetDelayMoment() + 500); // xinef: increase this time so we dont leave and enter combat in a moment
-
     if (m_caster->IsPlayer())
         if (m_caster->ToPlayer()->GetCommandStatus(CHEAT_COOLDOWN))
             m_caster->ToPlayer()->RemoveSpellCooldown(m_spellInfo->Id, true);
@@ -4052,11 +4043,10 @@ void Spell::_cast(bool skipCheck)
 
     SetExecutedCurrently(false);
 
-    // Call CreatureAI hook OnSpellCastFinished
-    if (m_originalCaster)
-        if (Creature* caster = m_originalCaster->ToCreature())
-            if (caster->IsAIEnabled)
-                caster->AI()->OnSpellCastFinished(GetSpellInfo(), SPELL_FINISHED_SUCCESSFUL_CAST);
+    // Call CreatureAI hook on successful cast
+    if (Creature* caster = m_caster->ToCreature())
+        if (caster->IsAIEnabled)
+            caster->AI()->OnSpellCast(GetSpellInfo());
 }
 
 void Spell::handle_immediate()
@@ -4298,7 +4288,13 @@ void Spell::_handle_finish_phase()
             break;
         }
 
-        Unit::ProcSkillsAndAuras(m_originalCaster, nullptr, procAttacker, PROC_FLAG_NONE, hitMask, 1, BASE_ATTACK, m_spellInfo, m_triggeredByAuraSpell.spellInfo,
+        // For trap activation, pass the original target (trap triggerer) so proc trigger spells
+        // like Entrapment can find a valid target to cast on
+        Unit* finishVictim = nullptr;
+        if (procAttacker & PROC_FLAG_DONE_TRAP_ACTIVATION)
+            finishVictim = GetOriginalTarget();
+
+        Unit::ProcSkillsAndAuras(m_originalCaster, finishVictim, procAttacker, PROC_FLAG_NONE, hitMask, 1, BASE_ATTACK, m_spellInfo, m_triggeredByAuraSpell.spellInfo,
             m_triggeredByAuraSpell.effectIndex, this, nullptr, nullptr, PROC_SPELL_PHASE_FINISH);
     }
 }
@@ -4416,7 +4412,7 @@ void Spell::update(uint32 difftime)
                     // We call the hook here instead of in Spell::finish because we only want to call it for completed channeling. Everything else is handled by interrupts
                     if (Creature* creatureCaster = m_caster->ToCreature())
                         if (creatureCaster->IsAIEnabled)
-                            creatureCaster->AI()->OnSpellCastFinished(m_spellInfo, SPELL_FINISHED_CHANNELING_COMPLETE);
+                            creatureCaster->AI()->OnChannelFinished(m_spellInfo);
                 }
                 // Xinef: Dont update channeled target list on last tick, allow auras to update duration properly
                 // Xinef: Added this strange check because of diffrent update routines for players / creatures
@@ -4478,8 +4474,8 @@ void Spell::finish(bool ok)
             // Xinef: Reset cooldown event in case of fail cast
             if (m_spellInfo->IsCooldownStartedOnEvent())
                 m_caster->ToPlayer()->SendCooldownEvent(m_spellInfo, 0, 0, false);
-
         }
+
         return;
     }
 
@@ -5543,11 +5539,13 @@ void Spell::HandleThreatSpells()
     if (m_spellInfo->HasAttribute(SPELL_ATTR1_NO_THREAT) || m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS))
         return;
 
+    Unit* unitCaster = m_originalCaster ? m_originalCaster : m_caster;
+
     float threat = 0.0f;
     if (SpellThreatEntry const* threatEntry = sSpellMgr->GetSpellThreatEntry(m_spellInfo->Id))
     {
         if (threatEntry->apPctMod != 0.0f)
-            threat += threatEntry->apPctMod * m_caster->GetTotalAttackPowerValue(BASE_ATTACK);
+            threat += threatEntry->apPctMod * unitCaster->GetTotalAttackPowerValue(BASE_ATTACK);
 
         threat += threatEntry->flatMod;
     }
@@ -5561,23 +5559,27 @@ void Spell::HandleThreatSpells()
     // since 2.0.1 threat from positive effects also is distributed among all targets, so the overall caused threat is at most the defined bonus
     threat /= m_UniqueTargetInfo.size();
 
-    for (std::list<TargetInfo>::iterator ihit = m_UniqueTargetInfo.begin(); ihit != m_UniqueTargetInfo.end(); ++ihit)
+    for (auto& ihit : m_UniqueTargetInfo)
     {
         float threatToAdd = threat;
-        if (ihit->missCondition != SPELL_MISS_NONE)
+        if (ihit.missCondition != SPELL_MISS_NONE)
             threatToAdd = 0.0f;
 
-        Unit* target = ObjectAccessor::GetUnit(*m_caster, ihit->targetGUID);
+        Unit* target = ObjectAccessor::GetUnit(*unitCaster, ihit.targetGUID);
         if (!target)
             continue;
 
-        bool IsFriendly = m_caster->IsFriendlyTo(target);
         // positive spells distribute threat among all units that are in combat with target, like healing
-        if (m_spellInfo->_IsPositiveSpell() && IsFriendly)
-            target->getHostileRefMgr().threatAssist(m_caster, threatToAdd, m_spellInfo);
+        if (m_spellInfo->_IsPositiveSpell())
+            target->GetThreatMgr().ForwardThreatForAssistingMe(unitCaster, threatToAdd, m_spellInfo);
         // for negative spells threat gets distributed among affected targets
-        else if (!m_spellInfo->_IsPositiveSpell() && !IsFriendly && target->CanHaveThreatList())
-            target->AddThreat(m_caster, threatToAdd, m_spellInfo->GetSchoolMask(), m_spellInfo);
+        // ignoreModifiers=true because flat SpellThreatEntry threat should not have modifiers applied twice
+        else
+        {
+            if (!target->CanHaveThreatList())
+                continue;
+            target->GetThreatMgr().AddThreat(unitCaster, threatToAdd, m_spellInfo, true);
+        }
     }
     LOG_DEBUG("spells.aura", "Spell {}, added an additional {} threat for {} {} target(s)", m_spellInfo->Id, threat, m_spellInfo->_IsPositiveSpell() ? "assisting" : "harming", uint32(m_UniqueTargetInfo.size()));
 }
@@ -5757,8 +5759,7 @@ SpellCastResult Spell::CheckCast(bool strict)
                                     if (Unit* victim = member->GetVictim())
                                         if (victim->IsInCombat() && m_caster->GetDistance(victim) < m_caster->GetVisibilityRange())
                                         {
-                                            m_caster->CombatStart(victim);
-                                            victim->AddThreat(m_caster, 1.0f);
+                                            m_caster->EngageWithTarget(victim);
                                             break;
                                         }
                     return SPELL_FAILED_TARGET_CANNOT_BE_RESURRECTED;
@@ -6878,9 +6879,9 @@ SpellCastResult Spell::CheckCasterAuras(bool preventionOnly) const
                 // Barkskin should skip sleep effects, sap and fears
                 if (m_spellInfo->Id == 22812)
                     mask |= 1 << MECHANIC_SAPPED | 1 << MECHANIC_HORROR | 1 << MECHANIC_SLEEP;
-                // Hand of Freedom, can be used while sapped
+                // Hand of Freedom, can be used while sapped and while under fear-mechanic stuns (e.g. Intimidating Shout primary target)
                 if (m_spellInfo->Id == 1044)
-                    mask |= 1 << MECHANIC_SAPPED;
+                    mask |= (1 << MECHANIC_SAPPED) | (1 << MECHANIC_FEAR);
                 Unit::AuraEffectList const& stunAuras = m_caster->GetAuraEffectsByType(SPELL_AURA_MOD_STUN);
                 for (Unit::AuraEffectList::const_iterator i = stunAuras.begin(); i != stunAuras.end(); ++i)
                 {
@@ -6943,9 +6944,9 @@ SpellCastResult Spell::CheckCasterAuras(bool preventionOnly) const
                                     // Barkskin should skip sleep effects, sap and fears
                                     if (m_spellInfo->Id == 22812)
                                         mask |= 1 << MECHANIC_SAPPED | 1 << MECHANIC_HORROR | 1 << MECHANIC_SLEEP;
-                                    // Hand of Freedom, can be used while sapped
+                                    // Hand of Freedom, can be used while sapped and while under fear-mechanic stuns (e.g. Intimidating Shout primary target)
                                     if (m_spellInfo->Id == 1044)
-                                        mask |= 1 << MECHANIC_SAPPED;
+                                        mask |= (1 << MECHANIC_SAPPED) | (1 << MECHANIC_FEAR);
 
                                     if (!usableInStun || !(auraInfo->GetAllEffectsMechanicMask() & mask))
                                         return SPELL_FAILED_STUNNED;

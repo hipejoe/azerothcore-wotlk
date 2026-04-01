@@ -22,6 +22,7 @@
 #include "Errors.h"
 #include "LFGMgr.h"
 #include "Log.h"
+#include "RaceMgr.h"
 #include "SharedDefines.h"
 #include "SpellMgr.h"
 #include "TransportMgr.h"
